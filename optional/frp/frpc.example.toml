@@ -1,0 +1,10 @@
+serverAddr = "<YOUR_FRP_SERVER_IP>"
+serverPort = 7000
+auth.token = "<REPLACE_WITH_YOUR_FRP_TOKEN>"
+
+[[proxies]]
+name = "wechat-sender"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8787
+remotePort = 8787

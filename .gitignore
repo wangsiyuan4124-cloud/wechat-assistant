@@ -1,0 +1,28 @@
+# 运行时数据与本地环境
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# 本机配置（含 token 等敏感信息，请从 config.example.yaml 复制后自行填写）
+config.yaml
+frpc.toml
+
+# 运行时产物
+queue.db
+queue.db-journal
+queue.db-wal
+*.log
+wechatauto_logs/
+@AutomationLog.txt
+.app.pid.lock
+
+# 安装包与二进制
+*.exe
+*.msi
+
+# 编辑器/系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
