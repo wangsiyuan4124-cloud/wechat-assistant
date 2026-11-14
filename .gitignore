@@ -26,3 +26,5 @@ wechatauto_logs/
 .idea/
 Thumbs.db
 desktop.ini
+
+runtime/

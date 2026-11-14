@@ -1,0 +1,1071 @@
+--- original/app.py
++++ modified/app.py
+@@ -17,10 +17,11 @@
+ import requests
+ import yaml
+ 
+-import subprocess
++from datetime import datetime
++import sys
+ 
+ import store
+-from wechat_client import make_client, com_init
++
+ 
+ BASE = Path(__file__).resolve().parent
+ 
+@@ -28,8 +29,9 @@
+ # Windows 上 Python 的 fcntl 不可用，用 msvcrt.locking 或直接 CreateMutex
+ try:
+     import msvcrt
+-    _lock_file = open(BASE / ".app.pid.lock", "w")
++    _lock_file = open(BASE / ".app.pid.lock", "a+")
+     try:
++        _lock_file.seek(0)
+         msvcrt.locking(_lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+     except OSError:
+         import sys
+@@ -41,8 +43,7 @@
+     _lock_file.write(str(os.getpid()))
+     _lock_file.flush()
+ except Exception as _e:
+-    # 锁不可用时不阻断，毕竟偶发冲突对只发不收影响有限
+-    pass
++    raise RuntimeError("无法取得单实例锁，停止启动") from _e
+ CFG = yaml.safe_load((BASE / "config.yaml").read_text(encoding="utf-8"))
+ 
+ logging.basicConfig(
+@@ -58,13 +59,10 @@
+ POLL = float(CFG["cloud"].get("poll_interval_sec", 15))
+ ALLOWED_GROUPS = set(CFG["wechat"]["groups"])
+ WATCH = float(CFG.get("watch", {}).get("interval_sec", 60))
+-AUTO_RESTART = bool(CFG.get("watch", {}).get("auto_restart_wechat", True))
+-WECHAT_EXE = str(CFG.get("watch", {}).get("wechat_exe", ""))
+-STUCK_THRESHOLD = int(CFG.get("watch", {}).get("stuck_threshold_sec", 120))
+ ALERT_COOLDOWN = 1800  # 掉线告警冷却 30 分钟
+ 
+-wx = make_client(CFG["wechat"].get("window_names", ["微信", "WeChat"]), log=log.info)
+-_send_lock = threading.Lock()
++if CFG['wechat'].get('engine', 'rpa') != 'rpa':
++    raise RuntimeError('本加固版本只启用 RPA；Hook 分支未验证，不允许直接启用')
+ 
+ 
+ # ---------- 云端交互 ----------
+@@ -81,7 +79,10 @@
+         if not d.get("ok"):
+             log.warning(f"fetch 被拒绝: {d.get('msg')}")
+             return []
+-        return d.get("items", [])
++        items = d.get('items', [])
++        if not isinstance(items, list):
++            raise ValueError('items must be a list')
++        return items
+     except Exception as e:
+         log.error(f"fetch 失败: {e}")
+         return []
+@@ -98,76 +99,32 @@
+ 
+ # ---------- 后台线程 ----------
+ 
+-def _restore_wechat_window():
+-    """把微信主窗口从各种"不正常"状态拉回到可见可操作。
+-
+-    覆盖场景：
+-    1. 最小化到任务栏（rect 超出屏幕或尺寸为 0）
+-    2. **Qt6 丢失 WS_VISIBLE 样式位**（窗口看着在屏幕上但 IsWindowVisible=False）
+-       — 微信 4.x 切到 Qt6 后频繁触发此问题，WeChatGUI 只枚举 IsWindowVisible 的窗口
+-       — 用 ShowWindow(hwnd, SW_SHOW) 强制把可见样式位加回去
+-    """
+-    from ctypes import wintypes
+-    user32 = ctypes.windll.user32
+-
+-    # 枚举所有顶层窗口，找微信主窗（Qt 类名前缀 or 标题含微信）
+-    CB = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+-    found_hwnd = None
+-    found_name = ""
+-    def cb(hwnd, _):
+-        nonlocal found_hwnd, found_name
+-        cls = ctypes.create_unicode_buffer(256)
+-        user32.GetClassNameW(hwnd, cls, 256)
+-        n = ctypes.create_unicode_buffer(256)
+-        user32.GetWindowTextW(hwnd, n, 256)
+-        if cls.value.startswith("Qt") and "微信" in n.value:
+-            found_hwnd = hwnd
+-            found_name = n.value
+-            return False  # 停止枚举
+-        return True
+-    user32.EnumWindows(CB(cb), 0)
+-
+-    if not found_hwnd:
+-        return False
+-
+-    needs_fix = False
+-    reason = []
+-
+-    # 检查 1：IsWindowVisible
+-    if not user32.IsWindowVisible(found_hwnd):
+-        needs_fix = True
+-        reason.append("IsWindowVisible=False（Qt6 丢失 WS_VISIBLE 样式位）")
+-
+-    # 检查 2：最小化特征（rect 尺寸 0 或坐标在 -32000 附近）
+-    rr = wintypes.RECT()
+-    user32.GetWindowRect(found_hwnd, ctypes.byref(rr))
+-    w = rr.right - rr.left
+-    h = rr.bottom - rr.top
+-    if w <= 1 or h <= 1 or rr.left < -10000:
+-        needs_fix = True
+-        reason.append(f"窗口尺寸/位置异常 rect=({rr.left},{rr.top},{rr.right},{rr.bottom})")
+-
+-    if needs_fix:
+-        # 强制 ShowWindow — 恢复可见性（同时处理 Qt6 样式位丢失和最小化）
+-        user32.ShowWindow(found_hwnd, 5)   # SW_SHOW
+-        user32.ShowWindow(found_hwnd, 9)   # SW_RESTORE
+-        time.sleep(0.2)
+-        # 放回屏幕中央可见区
+-        user32.SetWindowPos(found_hwnd, -1, 120, 40, 700, 560, 0x0040)
+-        log.info(f"已修复微信窗口 ({found_hwnd}): {'; '.join(reason)}")
+-    return True
+-
+-
+ def poll_loop():
+     """定时从云端拉取待发消息入本地队列"""
+     while True:
+         for it in fetch_pending():
++            if not isinstance(it, dict) or not all(isinstance(it.get(k), str) and it[k].strip() for k in ('group','text','msgId')):
++                log.error('云端任务结构无效，跳过')
++                continue
+             group, text, msg_id = it.get("group", ""), it.get("text", ""), it.get("msgId", "")
+             if group not in ALLOWED_GROUPS:
+                 log.warning(f"群「{group}」不在白名单，回执失败: {msg_id}")
+                 ack(msg_id, False, f"群「{group}」不在白名单")
+                 continue
+-            if store.enqueue(msg_id, group, text):
++            try:
++                raw_exp = it.get('expiresAt')
++                if raw_exp:
++                    dt = datetime.fromisoformat(str(raw_exp).replace('Z', '+00:00'))
++                    if dt.tzinfo is None:
++                        raise ValueError('expiresAt 必须包含时区')
++                    expiry = dt.timestamp()
++                else:
++                    expiry = time.time() + int(CFG.get('delivery', {}).get('default_ttl_sec', 3600))
++                added = store.enqueue(msg_id, group, text, expiry)
++            except (ValueError, TypeError, OverflowError) as e:
++                log.error('无效任务 %r: %s', msg_id, e)
++                continue
++            if added:
+                 log.info(f"入队 {msg_id} → {group}（{len(text)} 字）")
+             else:
+                 # 云端超时重放（如上次回执前进程被杀）：按本地现状补回执，避免云端反复重投
+@@ -175,136 +132,41 @@
+                 if st == "done":
+                     log.info(f"重复消息 {msg_id} 本地已完成，补回执 done")
+                     ack(msg_id, True)
+-                elif st == "failed":
++                elif st in ("failed", "expired"):
+                     log.info(f"重复消息 {msg_id} 本地已失败，补回执 failed")
+                     ack(msg_id, False, "本地发送失败(历史记录)")
++                elif st == 'uncertain':
++                    log.warning('任务 %s 等待人工核查；不回执失败、不重发', msg_id)
+                 # pending/sending 状态由 worker 完成后正常回执
+         time.sleep(POLL)
+ 
+ 
+ def worker_loop():
+-    """串行消费队列：微信 UI 操作必须独占，避免并发冲突。
+-
+-    加固点：
+-    - 微信离线类错误直接跳过重试（重启微信后才能发）
+-    - 普通错误走 3 次退避重试
+-    - 硬超时由 watcher 线程的 stuck reset 兜底（sending 超过 120s 强制重置）
+-    """
+-    com_init()
+-    RETRY_SLEEPS = (10, 60, 180, 300)  # 4 次退避重试间隔（秒）
++    from delivery import deliver
+     while True:
+         row = store.claim_next()
+-        if not row:
++        if row is None:
+             time.sleep(2)
+             continue
+-        msg_id = row["msg_id"]
+-        grp = row["grp"]
+-        text = row["text"]
+-        last_err = None
+-        ok = False
+-        hard_fail = False
+-        for attempt, slp in enumerate((0,) + RETRY_SLEEPS):
+-            if attempt > 0:
+-                log.warning(f"本地重试 #{attempt}，等 {slp}s 后再发 {msg_id}")
+-                time.sleep(slp)
+-            try:
+-                _restore_wechat_window()
+-                with _send_lock:
+-                    wx.send_to_group(grp, text)
+-                ok = True
+-                last_err = None
+-                break
+-            except Exception as e:
+-                last_err = str(e)
+-                log.warning(f"发送失败 attempt={attempt+1} {msg_id}: {last_err[:120]}")
+-                # 微信离线/UIA 不可用 类错误：直接跳过重试（重启微信后才能发）
+-                if any(kw in last_err for kw in (
+-                    "未找到微信", "疑似离线", "登录状态检测失败",
+-                    "UIA 引擎不可用", "找不到 ChatRoom",
+-                )):
+-                    log.error(f"微信不可用或群聊搜索失败，停止重试 {msg_id}")
+-                    hard_fail = True
+-                    break
+         try:
+-            if ok:
+-                store.finish(msg_id, True)
+-                log.info(f"完成 {msg_id}")
+-                ack(msg_id, True)
+-            else:
+-                store.finish(msg_id, False, last_err or "unknown")
+-                log.error(f"最终失败 {msg_id} (hard_fail={hard_fail}): {last_err}")
+-                ack(msg_id, False, last_err or "unknown")
+-                _alert(f"微信发送最终失败：{grp}（{msg_id}）\n{last_err or 'unknown'}")
++            status, error = deliver(dict(row), CFG, BASE)
+         except Exception as e:
+-            log.error(f"回执/落库异常 {msg_id}: {e}")
++            status, error = 'uncertain', f'delivery boundary error: {e}'
++        store.set_status(row['msg_id'], status, error)
++        if status == 'pending':
++            time.sleep(15)
++            continue
++        if status in ('done', 'failed', 'expired'):
++            ack(row['msg_id'], status == 'done', error)
++        if status == 'uncertain':
++            _alert(f"发送结果待核查，禁止自动重试：{row['msg_id']} / {error}")
+         time.sleep(2)
+ 
+ 
+ def watcher_loop():
+-    """定时检测微信登录状态 + 自动还原窗口 + 进程守护 + 卡死重置。
+-
+-    加固点：
+-    1. 微信离线 → 自动拉起 Weixin.exe（需 config.watch.wechat_exe 配置）
+-    2. sending 状态超过 STUCK_THRESHOLD 秒 → 强制重置为 pending（worker 硬超时兜底之外的保险）
+-    3. 窗口最小化 → 自动还原（已有逻辑）
+-    4. 离线告警冷却 30 分钟（避免刷屏）
+-    """
+-    com_init()
+-    last_alert = 0.0
+-    last_restart = 0.0  # 进程重启冷却，避免启动风暴
++    # Read-only health summary. Never manipulate or start WeChat here.
+     while True:
+-        try:
+-            # ---- 1. 进程守护：微信没了就拉起 ----
+-            if AUTO_RESTART and WECHAT_EXE:
+-                if not wx.is_logged_in():
+-                    now = time.time()
+-                    if now - last_restart > 300:  # 5 分钟冷却一次
+-                        log.warning(f"微信进程不在，尝试拉起: {WECHAT_EXE}")
+-                        try:
+-                            subprocess.Popen(
+-                                [WECHAT_EXE],
+-                                creationflags=subprocess.CREATE_NO_WINDOW,
+-                            )
+-                            last_restart = now
+-                            log.info("微信拉起成功，等待用户扫码登录")
+-                        except Exception as e:
+-                            log.error(f"微信拉起失败: {e}")
+-                    else:
+-                        log.info("微信不在重启冷却期内，跳过自动拉起")
+-
+-            # ---- 2. 离线告警 ----
+-            if not wx.is_logged_in():
+-                log.warning("微信疑似离线/未登录")
+-                if time.time() - last_alert > ALERT_COOLDOWN:
+-                    _alert("微信已离线或未登录，群消息发送服务暂停，请到本机扫码登录！")
+-                    last_alert = time.time()
+-            else:
+-                # 在线时顺便还原窗口
+-                _restore_wechat_window()
+-
+-            # ---- 3. 卡死重置：sending 超过阈值秒 → 放回 pending ----
+-            import sqlite3
+-            db = BASE / "queue.db"
+-            if db.exists():
+-                c = sqlite3.connect(str(db))
+-                stuck = c.execute(
+-                    "SELECT msg_id FROM messages WHERE status='sending' "
+-                    "AND julianday('now','localtime') - julianday(updated_at) > ? / 86400.0",
+-                    (STUCK_THRESHOLD,),
+-                ).fetchall()
+-                if stuck:
+-                    ids = [r[0] for r in stuck]
+-                    log.warning(
+-                        f"发现 {len(ids)} 条 sending 超过 {STUCK_THRESHOLD}s，强制重置为 pending: {ids}")
+-                    c.executemany(
+-                        "UPDATE messages SET status='pending', error='watchdog_stuck_reset', "
+-                        "updated_at=datetime('now','localtime') WHERE msg_id=?",
+-                        [(i,) for i in ids],
+-                    )
+-                    c.commit()
+-                c.close()
+-        except Exception as e:
+-            log.error(f"watcher 异常: {e}")
++        log.info("队列状态: %s", store.queue_depth())
+         time.sleep(WATCH)
+ 
+ 
+@@ -321,7 +183,7 @@
+ 
+ if __name__ == "__main__":
+     store.init_db()
+-    store.requeue_stuck()  # 重启续发
++    store.requeue_stuck()  # 重启后保留待核查状态，禁止自动续发
+     # 服务运行期间阻止系统自动睡眠（锁屏仍会导致发送失败，需保持不锁屏）
+     ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)  # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+     threading.Thread(target=poll_loop, daemon=True).start()
+--- original/store.py
++++ modified/store.py
+@@ -1,84 +1,53 @@
+-# -*- coding: utf-8 -*-
+-"""消息队列与去重存储（SQLite 单文件，随服务目录存放）"""
+-import os
++"""Persistent queue. Ambiguous sends never retry automatically."""
+ import sqlite3
++from contextlib import contextmanager
+ import threading
+-
+-_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queue.db")
++import time
++from pathlib import Path
++_DB = str(Path(__file__).with_name("queue.db"))
+ _lock = threading.Lock()
+-
+-
++@contextmanager
+ def _conn():
+     c = sqlite3.connect(_DB, timeout=10)
+     c.row_factory = sqlite3.Row
+-    return c
+-
+-
++    try:
++        with c:
++            yield c
++    finally:
++        c.close()
+ def init_db():
+     with _lock, _conn() as c:
+-        c.execute("""
+-            CREATE TABLE IF NOT EXISTS messages (
+-                msg_id     TEXT PRIMARY KEY,
+-                grp        TEXT NOT NULL,
+-                text       TEXT NOT NULL,
+-                status     TEXT NOT NULL DEFAULT 'pending',  -- pending / sending / done / failed
+-                error      TEXT,
+-                created_at TEXT DEFAULT (datetime('now','localtime')),
+-                updated_at TEXT
+-            )
+-        """)
+-        c.execute("CREATE INDEX IF NOT EXISTS idx_msg_status ON messages(status)")
+-
+-
+-def enqueue(msg_id, grp, text):
+-    """幂等入库：msg_id 重复直接忽略。返回 True=新入队，False=重复"""
++        c.execute("CREATE TABLE IF NOT EXISTS messages (msg_id TEXT PRIMARY KEY, grp TEXT NOT NULL, text TEXT NOT NULL, status TEXT DEFAULT 'pending', error TEXT, created_at TEXT DEFAULT (datetime('now','localtime')), updated_at TEXT, expires_at REAL)")
++        if 'expires_at' not in {r[1] for r in c.execute('PRAGMA table_info(messages)')}:
++            c.execute('ALTER TABLE messages ADD COLUMN expires_at REAL')
++        c.execute('CREATE INDEX IF NOT EXISTS idx_msg_status ON messages(status)')
++def enqueue(msg_id, grp, text, expires_at):
++    if not all(isinstance(x, str) and x.strip() for x in (msg_id, grp, text)):
++        raise ValueError('msgId/group/text must be nonempty strings')
+     with _lock, _conn() as c:
+-        cur = c.execute(
+-            "INSERT OR IGNORE INTO messages (msg_id, grp, text) VALUES (?,?,?)",
+-            (msg_id, grp, text),
+-        )
+-        return cur.rowcount > 0
+-
+-
++        return c.execute('INSERT OR IGNORE INTO messages(msg_id,grp,text,expires_at) VALUES(?,?,?,?)', (msg_id,grp,text,expires_at)).rowcount > 0
+ def claim_next():
+-    """取下一条 pending 消息并标记 sending，返回 Row 或 None"""
+     with _lock, _conn() as c:
+-        row = c.execute(
+-            "SELECT * FROM messages WHERE status='pending' ORDER BY created_at LIMIT 1"
+-        ).fetchone()
+-        if not row:
+-            return None
+-        c.execute(
+-            "UPDATE messages SET status='sending', updated_at=datetime('now','localtime') WHERE msg_id=?",
+-            (row["msg_id"],),
+-        )
++        c.execute('BEGIN IMMEDIATE')
++        row = c.execute("SELECT * FROM messages WHERE status='pending' ORDER BY created_at,rowid LIMIT 1").fetchone()
++        if row:
++            c.execute("UPDATE messages SET status='sending',updated_at=datetime('now','localtime') WHERE msg_id=?",(row['msg_id'],))
+         return row
+-
+-
+-def finish(msg_id, ok, error=""):
++def set_status(msg_id, status, error=''):
++    if status not in {'pending','sending','done','failed','uncertain','expired'}:
++        raise ValueError(status)
+     with _lock, _conn() as c:
+-        c.execute(
+-            "UPDATE messages SET status=?, error=?, updated_at=datetime('now','localtime') WHERE msg_id=?",
+-            ("done" if ok else "failed", error, msg_id),
+-        )
+-
+-
++        c.execute("UPDATE messages SET status=?,error=?,updated_at=datetime('now','localtime') WHERE msg_id=?",(status,error,msg_id))
++def finish(msg_id, ok, error=''):
++    set_status(msg_id,'done' if ok else 'failed',error)
+ def requeue_stuck():
+-    """服务重启后，把中断在 sending 的消息放回 pending。
+-    注意：若发送动作已实际完成但状态未落库，重启后可能重发一次，业务侧需能容忍。"""
++    # Legacy name retained for compatibility. Never requeue ambiguous work.
+     with _lock, _conn() as c:
+-        c.execute("UPDATE messages SET status='pending' WHERE status='sending'")
+-
+-
++        c.execute("UPDATE messages SET status='uncertain',error='process interrupted; inspect before retry',updated_at=datetime('now','localtime') WHERE status='sending'")
+ def get_status(msg_id):
+-    """查询消息本地状态，不存在返回 None"""
+     with _conn() as c:
+-        row = c.execute("SELECT status FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
+-        return row["status"] if row else None
+-
+-
++        r=c.execute('SELECT status FROM messages WHERE msg_id=?',(msg_id,)).fetchone()
++        return r['status'] if r else None
+ def queue_depth():
+     with _conn() as c:
+-        p = c.execute("SELECT COUNT(*) n FROM messages WHERE status='pending'").fetchone()["n"]
+-        f = c.execute("SELECT COUNT(*) n FROM messages WHERE status='failed'").fetchone()["n"]
+-        return {"pending": p, "failed": f}
++        return dict(c.execute('SELECT status,COUNT(*) FROM messages GROUP BY status').fetchall())
+--- original/wechat_client.py
++++ modified/wechat_client.py
+@@ -1,13 +1,5 @@
+ # -*- coding: utf-8 -*-
+-"""微信发送客户端：双引擎
+-
+-- wcferry（hook，主力）：注入微信 3.9.12.51，API 级发送。
+-  按 wxid 精确投递，天然零错群；最小化/锁屏均可发送。
+-- wechatauto（RPA，备用）：UIA 控件树操作微信 4.x。
+-  已加固：精确匹配 ChatRoom section + 严格名称校验 + 单条超时保护。
+-
+-config.yaml → wechat.engine: "wcferry" | "rpa"
+-"""
++"""RPA adapter. One attempt only; requires a dedicated interactive desktop."""
+ import threading
+ import time
+ 
+@@ -20,68 +12,10 @@
+ def _engine_name():
+     try:
+         cfg = yaml.safe_load((BASE / "config.yaml").read_text(encoding="utf-8"))
+-        return (cfg.get("wechat") or {}).get("engine", "wcferry")
++        return (cfg.get("wechat") or {}).get("engine", "rpa")
+     except Exception:
+-        return "wcferry"
++        return "rpa"
+ 
+-
+-class WcferryClient:
+-    """hook 引擎：API 级收发，无 UI 依赖"""
+-
+-    def __init__(self, window_names=None, log=print):
+-        self.log = log
+-        self._wcf = None
+-        self._lock = threading.Lock()
+-
+-    def _get(self):
+-        if self._wcf is None:
+-            from wcferry import Wcf
+-            self._wcf = Wcf(debug=False)
+-            self.log("[wcferry] 已注入微信，RPC 连接成功")
+-        return self._wcf
+-
+-    def is_logged_in(self):
+-        try:
+-            with self._lock:
+-                return bool(self._get().is_login())
+-        except Exception as e:
+-            self.log(f"[wcferry] 登录状态检测失败: {e}")
+-            return False
+-
+-    def _room_id(self, group):
+-        w = self._get()
+-        for c in w.get_contacts():
+-            if not str(getattr(c, "wxid", "")).endswith("@chatroom"):
+-                continue
+-            if group in (getattr(c, "name", ""), getattr(c, "remark", "")):
+-                return c.wxid
+-        return None
+-
+-    def send_to_group(self, group, text, retries=3):
+-        last_err = None
+-        for i in range(1, retries + 1):
+-            try:
+-                with self._lock:
+-                    w = self._get()
+-                    rid = self._room_id(group)
+-                    if not rid:
+-                        raise RuntimeError(
+-                            f"联系人列表中找不到群「{group}」"
+-                            f"（请确认本微信账号已在群内）")
+-                    if not w.send_text(text, rid):
+-                        raise RuntimeError("send_text 返回失败")
+-                self.log(f"[wcferry] 已发送 → {group}（{rid}）")
+-                return
+-            except Exception as e:
+-                last_err = str(e)
+-                self.log(f"[wcferry] 第 {i}/{retries} 次发送失败: {last_err}")
+-                time.sleep(2)
+-        raise RuntimeError(f"发送到「{group}」重试 {retries} 次均失败: {last_err}")
+-
+-
+-# =========================================================================
+-# RPA 引擎：加固版
+-# =========================================================================
+ 
+ class RpaClient:
+     """RPA 备用引擎：wechatauto UIA 操作微信 4.x
+@@ -152,15 +86,14 @@
+     def _ensure_chat(self, uia, group, timeout=10):
+         """确保当前会话是目标群。加固版：强制 ChatRoom section + 严格名称校验。"""
+         cur = uia.current_chat()
+-        if cur == group:
+-            return True
++        # Always search within group results, even if a same-named chat is open.
+         self.log(f"[wechat] 当前会话={cur!r}，目标={group!r}，开始搜索")
+ 
+         # 强制带 section='ChatRoom'——只在群聊结果里搜，绝不碰个人/系统账号
+         try:
+             ok = uia.open_chat(group, section="ChatRoom")
+-        except TypeError:
+-            ok = uia.open_chat(group)
++        except TypeError as e:
++            raise RuntimeError('依赖不支持群类型过滤，停止发送') from e
+ 
+         if not ok:
+             self.log(f"[wechat] 搜索返回 False，找不到 ChatRoom 匹配的「{group}」")
+@@ -180,11 +113,11 @@
+ 
+     # ---------- send_to_group ----------
+ 
+-    def send_to_group(self, group, text, retries=3):
++    def send_to_group(self, group, text, retries=1):
+         """发送文本到指定群。加固：ChatRoom section + exact name 强校验。
+ 
+         注意：UIA COM 必须在同一个线程里 Initialize + 使用，
+-        所以这里**不做线程隔离**。硬超时由调用方的 watcher stuck reset 兜底。
++        所以这里**不做线程隔离**。硬超时由父进程终止发送子进程处理。
+         """
+         gui, uia = self._engine()
+         from wechatauto.param import WxParam
+@@ -225,18 +158,16 @@
+ 
+ 
+ def com_init():
+-    if _engine_name() == "wcferry":
+-        return
+     try:
+         import uiautomation as auto
+         auto.InitializeUIAutomationInCurrentThread()
+-    except Exception:
+-        pass
++    except Exception as e:
++        raise RuntimeError('UIA 初始化失败') from e
+ 
+ 
+ def make_client(window_names=None, log=print):
+     engine = _engine_name()
+     log(f"[engine] 使用 {engine} 引擎")
+-    if engine == "wcferry":
+-        return WcferryClient(log=log)
++    if engine != 'rpa':
++        raise RuntimeError('仅启用 RPA，Hook 未验证')
+     return RpaClient(window_names=window_names, log=log)
+--- original/delivery.py
++++ modified/delivery.py
+@@ -0,0 +1,41 @@
++"""Subprocess boundary: no ambiguous sends are retried automatically."""
++import json
++import subprocess
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++
++def deliver(row, cfg, base, *, test_mode=None):
++    expiry = row.get('expires_at')
++    if expiry is None or expiry <= time.time():
++        return 'expired', 'expired or legacy task without expiry'
++    if row['grp'] not in cfg['wechat']['groups']:
++        return 'failed', 'target outside allowlist'
++    runtime = Path(base) / 'runtime'
++    runtime.mkdir(exist_ok=True)
++    with tempfile.TemporaryDirectory(dir=runtime) as tmp:
++        request = Path(tmp) / 'request.json'
++        result = Path(tmp) / 'result.json'
++        request.write_text(json.dumps({'row': row, 'result': str(result), 'test_mode': test_mode}), encoding='utf-8')
++        timeout = max(0.1, float(cfg.get('delivery', {}).get('send_timeout_sec', 45)))
++        with (runtime / 'sender.log').open('a', encoding='utf-8') as log:
++            proc = subprocess.Popen([sys.executable, str(Path(__file__).with_name('send_once.py')), str(request)],
++                                    cwd=str(base), stdout=log, stderr=log,
++                                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
++            try:
++                code = proc.wait(timeout=timeout)
++            except subprocess.TimeoutExpired:
++                proc.kill()
++                proc.wait()
++                return 'uncertain', 'sender terminated on timeout; inspect WeChat before retry'
++        if code != 0 or not result.exists():
++            return 'uncertain', 'sender interrupted without reliable outcome'
++        try:
++            outcome = json.loads(result.read_text(encoding='utf-8'))
++            if outcome['status'] not in ('done', 'pending', 'expired', 'uncertain'):
++                raise ValueError('invalid status')
++            return outcome['status'], outcome.get('error', '')
++        except (ValueError, KeyError):
++            return 'uncertain', 'invalid sender outcome'
+--- original/send_once.py
++++ modified/send_once.py
+@@ -0,0 +1,81 @@
++"""Single send process. Imported by no background thread."""
++import json
++import os
++import sys
++import time
++from pathlib import Path
++
++
++def desktop_ready():
++    import ctypes
++    from ctypes import wintypes
++    u = ctypes.windll.user32
++    u.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
++    u.OpenInputDesktop.restype = wintypes.HANDLE
++    u.SwitchDesktop.argtypes = [wintypes.HANDLE]
++    u.CloseDesktop.argtypes = [wintypes.HANDLE]
++    desktop = u.OpenInputDesktop(0, False, 0x0100)
++    if not desktop:
++        return False
++    try:
++        if not u.SwitchDesktop(desktop):
++            return False
++    finally:
++        u.CloseDesktop(desktop)
++    u.IsWindowVisible.argtypes = [wintypes.HWND]
++    u.IsIconic.argtypes = [wintypes.HWND]
++    u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
++    u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
++    found = []
++    cbtype = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
++    def cb(hwnd, _):
++        title = ctypes.create_unicode_buffer(256)
++        cls = ctypes.create_unicode_buffer(256)
++        u.GetWindowTextW(hwnd, title, 256)
++        u.GetClassNameW(hwnd, cls, 256)
++        if title.value in ('微信', 'WeChat', 'Weixin') and cls.value.startswith('Qt') and u.IsWindowVisible(hwnd) and not u.IsIconic(hwnd):
++            found.append(hwnd)
++        return True
++    u.EnumWindows(cbtype(cb), 0)
++    return len(found) == 1
++
++
++def execute(data):
++    # Test modes are CLI-local and never taken from cloud task fields.
++    mode = data.get('test_mode')
++    if mode:
++        if mode == 'timeout':
++            time.sleep(60)
++        if mode == 'crash':
++            os._exit(3)
++        return {'status': {'success': 'done', 'deferred': 'pending', 'ambiguous': 'uncertain'}[mode]}
++    row = data['row']
++    if row['expires_at'] <= time.time():
++        return {'status': 'expired', 'error': 'expired before send'}
++    if not desktop_ready():
++        return {'status': 'pending', 'error': 'desktop locked or WeChat window unavailable; no UI action taken'}
++    import yaml
++    from wechat_client import make_client, com_init
++    cfg = yaml.safe_load(Path(__file__).with_name('config.yaml').read_text(encoding='utf-8'))
++    if cfg['wechat'].get('engine', 'rpa') != 'rpa' or row['grp'] not in cfg['wechat']['groups']:
++        return {'status': 'uncertain', 'error': 'configuration changed; inspect task'}
++    com_init()
++    client = make_client(log=print)
++    # From this point any exception may follow an actual send. Never auto-retry.
++    try:
++        client.send_to_group(row['grp'], row['text'], retries=1)
++        return {'status': 'done', 'error': 'UI send returned; recipient delivery not verified'}
++    except Exception as e:
++        return {'status': 'uncertain', 'error': str(e)}
++
++
++if __name__ == '__main__':
++    data = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
++    try:
++        outcome = execute(data)
++    except Exception as e:
++        outcome = {'status': 'uncertain', 'error': str(e)}
++    dest = Path(data['result'])
++    temp = dest.with_suffix('.tmp')
++    temp.write_text(json.dumps(outcome), encoding='utf-8')
++    temp.replace(dest)
+--- original/test_safety.py
++++ modified/test_safety.py
+@@ -0,0 +1,69 @@
++import ast
++import sqlite3
++import tempfile
++import time
++import unittest
++from pathlib import Path
++import delivery
++import store
++
++class QueueTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp=tempfile.TemporaryDirectory(dir=Path(__file__).parent/'runtime')
++        self.old=store._DB
++        store._DB=str(Path(self.tmp.name)/'queue.db')
++        store.init_db()
++    def tearDown(self):
++        store._DB=self.old
++        self.tmp.cleanup()
++    def test_cloud_replay_does_not_requeue_done(self):
++        self.assertTrue(store.enqueue('id','group','hello',time.time()+60))
++        store.claim_next(); store.finish('id',True)
++        self.assertFalse(store.enqueue('id','group','hello',time.time()+600))
++        self.assertEqual(store.get_status('id'),'done')
++        self.assertIsNone(store.claim_next())
++    def test_restart_holds_ambiguous_send(self):
++        store.enqueue('id','group','hello',time.time()+60)
++        store.claim_next(); store.requeue_stuck()
++        self.assertEqual(store.get_status('id'),'uncertain')
++        self.assertIsNone(store.claim_next())
++    def test_migration_preserves_old_queue(self):
++        with sqlite3.connect(store._DB) as c:
++            c.execute('DROP TABLE messages')
++            c.execute("CREATE TABLE messages(msg_id TEXT PRIMARY KEY,grp TEXT,text TEXT,status TEXT, error TEXT,created_at TEXT,updated_at TEXT)")
++            c.execute("INSERT INTO messages(msg_id,grp,text,status) VALUES('legacy','group','hello','sending')")
++        c.close()
++        store.init_db();store.requeue_stuck()
++        self.assertEqual(store.get_status('legacy'),'uncertain')
++    def test_invalid_message_rejected(self):
++        with self.assertRaises(ValueError): store.enqueue('', 'group','hello',1)
++
++class DeliveryTests(unittest.TestCase):
++    def setUp(self):
++        self.base=Path(__file__).parent
++        self.row={'msg_id':'test','grp':'group','text':'simulated','expires_at':time.time()+60}
++        self.cfg={'wechat':{'groups':['group']},'delivery':{'send_timeout_sec':2}}
++    def run_mode(self,mode):
++        return delivery.deliver(self.row,self.cfg,self.base,test_mode=mode)[0]
++    def test_success(self): self.assertEqual(self.run_mode('success'),'done')
++    def test_window_unavailable_is_deferred(self): self.assertEqual(self.run_mode('deferred'),'pending')
++    def test_ambiguous_is_held(self): self.assertEqual(self.run_mode('ambiguous'),'uncertain')
++    def test_crash_is_held(self): self.assertEqual(self.run_mode('crash'),'uncertain')
++    def test_timeout_kills_process_and_holds(self):
++        self.cfg['delivery']['send_timeout_sec']=0.2
++        start=time.monotonic()
++        self.assertEqual(self.run_mode('timeout'),'uncertain')
++        self.assertLess(time.monotonic()-start,5)
++    def test_expired_not_dispatched(self):
++        self.row['expires_at']=time.time()-1
++        self.assertEqual(self.run_mode('success'),'expired')
++    def test_legacy_without_expiry_not_dispatched(self):
++        self.row['expires_at']=None
++        self.assertEqual(self.run_mode('success'),'expired')
++    def test_unapproved_group_not_dispatched(self):
++        self.row['grp']='other'
++        self.assertEqual(self.run_mode('success'),'failed')
++
++if __name__=='__main__':
++    (Path(__file__).parent/'runtime').mkdir(exist_ok=True)
++    unittest.main(verbosity=2)
+--- original/requirements.txt
++++ modified/requirements.txt
+@@ -1,5 +1,3 @@
+-flask>=2.2
+-waitress>=2.1
+ uiautomation>=2.0.20
+ pyperclip>=1.8
+ pyyaml>=6.0
+@@ -7,4 +5,3 @@
+ wechatauto-replica
+ pillow
+ pyautogui
+-wcferry==39.5.2.0
+--- original/config.example.yaml
++++ modified/config.example.yaml
+@@ -1,28 +1,15 @@
+ cloud:
+-  # pull-wechat 云函数的 HTTP 触发器地址（替换成你自己的环境地址）
+-  pull_url: "https://<your-env-id>.service.tcloudbase.com/pull-wechat"
+-  # 与 pull-wechat 环境变量 SENDER_TOKEN 一致（自行生成一个随机串填这里）
+-  token: "<REPLACE_WITH_YOUR_SENDER_TOKEN>"
++  pull_url: "https://YOUR-HOST/pull-wechat"
++  token: "REPLACE_WITH_RANDOM_SECRET"
+   poll_interval_sec: 15
+-
+ wechat:
+-  # 发送引擎：wcferry = hook 注入微信 3.9.12.x（API 级，零错群，不依赖窗口）
+-  #           rpa     = wechatauto UIA 操作微信 4.x（依赖窗口可见）
+   engine: "rpa"
+-  window_names: ["微信", "WeChat"]
+-  # 群名白名单：只允许向这些群发消息（改成你的真实群名）
+   groups:
+-    - "文件传输助手"
+-    - "测试群（改成你的群名）"
+-
++    - "自动通知测试群-唯一名称"
++delivery:
++  send_timeout_sec: 45
++  default_ttl_sec: 3600
+ watch:
+   interval_sec: 60
+-  # 微信进程守护：进程不在时自动拉起（改成本机微信可执行文件路径）
+-  auto_restart_wechat: true
+-  wechat_exe: "C:\\Program Files\\Tencent\\Weixin\\Weixin.exe"
+-  # sending 状态超过多少秒视为卡死，强制重置为 pending
+-  stuck_threshold_sec: 120
+-
+ alerts:
+-  # 备用告警：企业微信群机器人 webhook，掉线/失败时通知；留空则只写日志
+   wechat_work_webhook: ""
+--- original/README.md
++++ modified/README.md
+@@ -1,120 +1,62 @@
+-# wechat-assistant
++# 微信群发送服务：本地加固版
+ 
+-Windows 本机运行的**微信群消息自动发送服务**（只发不收）。业务侧在云端生成待发消息，本机定时拉取并通过微信客户端投递到指定群，然后回执云端。
++基于 wangsiyuan4124-cloud/wechat-assistant，原始提交 a2703ab860d81d5bc2a43b215aa556150d603317。
+ 
+-## 架构
++## 当前完成情况
+ 
+-```
+-业务触发（小程序 / 云端定时扫描）
+-        ↓
+-云函数 push-wechat  →  云数据库 wechat_outbox
+-        ↓  （本机主动轮询，无需公网入口）
+-本机 pull-wechat 拉取
+-        ↓
+-本地 SQLite 队列（queue.db）
+-        ↓
+-微信客户端发送（wcferry hook 或 wechatauto UIA）
+-        ↓
+-ack 回执云端
+-```
++已完成本地代码修改与 12 项模拟测试；没有安装微信自动化依赖、启动微信或发送真实消息。未修改远端仓库。此包是待联调版本，不是已上线服务。
+ 
+-三个后台线程：
++## 使用环境
+ 
+-| 线程 | 职责 |
+-|---|---|
+-| `poll_loop` | 按 `poll_interval_sec` 轮询云端，把待发消息入本地队列（msg_id 幂等去重） |
+-| `worker_loop` | 串行消费队列；失败退避重试 10s/60s/180s/300s，微信离线类错误快速失败 |
+-| `watcher_loop` | 每 60s 检查微信在线状态、自动还原/拉起微信窗口、重置卡死超过 120s 的 sending 记录 |
++推荐独立 Windows 电脑或 Windows 虚拟机。只启用 RPA，Hook 分支不作为交付能力。
++正常发送仍会操作会话和输入框，可能影响焦点/剪贴板。后台运行 Python 不等于微信无界面操作。
++预检查要求微信主窗口可见、非最小化且桌面未锁定；不满足时等待直到任务过期。
++预检查为保守判断，部分微信版本可能不通过，需要本机联调，不能直接绕过检查。
++程序不自动启动、移动、还原或置顶微信。依赖库在正常发送时仍可能激活窗口。
++请给目标群设置唯一名称；RPA 按名称校验无法彻底排除同名会话，不承诺零错群。
+ 
+-## 环境要求
++## 安装与启动（在专用运行环境执行）
+ 
+-- Windows 10/11
+-- Python 3.10+（建议 3.12）
+-- 已登录的微信桌面客户端
+-  - `engine: wcferry` → 需要微信 **3.9.12.x**（API 级注入，不依赖窗口可见，最稳）
+-  - `engine: rpa` → 支持微信 4.x（UIA 操作，**要求微信主窗口保持可见、不最小化**）
+-
+-## 安装
++安装 Python 3.12，然后在项目目录运行：
+ 
+ ```powershell
+ python -m venv .venv
+ .\.venv\Scripts\python.exe -m pip install -r requirements.txt
++Copy-Item config.example.yaml config.yaml
++# 编辑 config.yaml：接口地址、随机密钥、唯一群名、发送超时和有效期
++.\.venv\Scripts\python.exe -u app.py
+ ```
+ 
+-## 配置
++先以前台模式在测试群验证；验证后可以双击 run-sender.bat 后台运行。未配置自动启动项。
++依赖版本尚未在本机验证，requirements.txt 中的范围不代表兼容性保证；联调后需固定实际版本。
++
++## 状态与故障处理
++
++- pending：等待处理；桌面不可操作时保留等待。
++- sending：独立子进程正在尝试，默认 45 秒超时。
++- done：UI 发送函数返回成功，不代表对方收到或阅读。
++- uncertain：发送异常、子进程超时/退出或服务中断，禁止自动重发。
++- expired：过期或历史任务缺少有效期，不发送。
++- failed：白名单等明确拒绝。
++
++重启将 sending 转为 uncertain。msgId 是入队去重键，不能实现端到端严格只发送一次。
++出现 uncertain 后先停服务，查看 queue.db、service.log、runtime/sender.log 和微信群实际记录。
++确认已发：备份 queue.db 后将对应记录设为 done；下次云端重放时补成功回执。
++确认取消：设为 failed；下次重放时补失败回执。
++确认未发且确需重试：由业务端明确创建新的 msgId 与 expiresAt，原任务设为 failed；不要直接删除旧记录。
++没有证据时保留 uncertain。不要删除 queue.db，否则会丢失去重与核查记录。
++
++## 云端连接
++
++见 CLOUD_API.md。云端服务未包含在原仓库，也未在此包部署。
++必须采用单发送器归属：多台机器使用同一账号/队列会破坏本地去重假设。
++
++## 检查
+ 
+ ```powershell
+-Copy-Item config.example.yaml config.yaml
++python -B test_safety.py
+ ```
+ 
+-然后编辑 `config.yaml`，至少填写：
+-
+-| 字段 | 说明 |
+-|---|---|
+-| `cloud.pull_url` | 云函数 HTTP 触发器地址 |
+-| `cloud.token` | 与云端 `SENDER_TOKEN` 环境变量一致；**不要提交真实值** |
+-| `wechat.engine` | `wcferry` 或 `rpa` |
+-| `wechat.groups` | 群白名单，只允许向这些群发送 |
+-| `watch.wechat_exe` | 微信可执行文件路径（用于掉线自动拉起） |
+-| `alerts.wechat_work_webhook` | 可选，企业微信群机器人 webhook，留空则只写日志 |
+-
+-`config.yaml` 已加入 `.gitignore`，不会被提交。
+-
+-## 启动
+-
+-```powershell
+-# 前台调试（可见输出）
+-.\.venv\Scripts\python.exe -u app.py
+-
+-# 后台运行（无窗口）
+-start "" .venv\Scripts\pythonw.exe -u app.py
+-```
+-
+-或直接双击 `run-sender.bat`（内部含单实例检查）。
+-
+-开机自启：把 `run-sender.bat` 的快捷方式放入
+-`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`。
+-不再需要时把该 `.lnk` 重命名为 `.lnk.disabled` 即可，不必删除。
+-
+-## 运行时文件位置
+-
+-| 文件 | 路径 | 说明 |
+-|---|---|---|
+-| 消息队列 | `./queue.db` | SQLite，表 `messages`（`msg_id / grp / text / status / error / created_at / updated_at`） |
+-| 服务日志 | `./service.log` | 主日志，含入队/发送/失败记录 |
+-| 健康快照 | `./health.log` | `health-watch.py` 每 5 分钟追加 |
+-| 微信自动化日志 | `./wechatauto_logs/` | wechatauto 引擎自动生成 |
+-| 单实例锁 | `./.app.pid.lock` | 进程退出后为僵尸锁，可直接删除 |
+-
+-队列状态机：`pending → sending → done | failed`。
+-服务重启时会把残留的 `sending` 重置为 `pending` 续发（业务侧需容忍极少数重复发送）。
+-
+-```powershell
+-# 查看队列概况
+-.\.venv\Scripts\python.exe -c "import store;print(store.queue_depth())"
+-```
+-
+-## 健康监控
+-
+-```powershell
+-.\.venv\Scripts\pythonw.exe -u health-watch.py
+-```
+-
+-每 5 分钟往 `health.log` 写一条快照：进程 PID、微信窗口可见性、队列计数、最近 WARNING。
+-
+-## 已知限制
+-
+-- **RPA 引擎依赖窗口可见**：微信被最小化或在离屏坐标时 UIA 看不到控件，发送会失败。服务内已做自动还原（`ShowWindow` + `SW_RESTORE`），但锁屏仍会导致失败，需保持不锁屏。
+-- **微信 4.x 的 Qt6 会丢失 `WS_VISIBLE` 样式位**：窗口看着在屏幕上但 `IsWindowVisible=False`，`_restore_wechat_window()` 已修复该情况。
+-- `wcferry` 仅支持微信 3.9.12.x，4.x 无法注入。
+-- 群名必须与微信群列表中的名称完全一致（白名单 + 精确匹配双重校验，防止发错群）。
+-
+-## 可选：内网穿透（旧方案）
+-
+-`optional/frp/` 下保留了早期「云端反向推送」架构所需的 frps 部署脚本与客户端配置样例。当前默认的轮询架构**不需要**它。
+-
+-## 安全说明
+-
+-- 仓库内所有 token / webhook / 服务器地址均为占位符，请自行填写。
+-- 群白名单 + 精确会话校验，避免误发到非目标群。
+-- `msg_id` 幂等，云端超时重放不会造成本地重复入队。
++测试不导入微信引擎、不连接云端、不发送微信，覆盖去重、重启保留、历史数据库迁移、过期、白名单、模拟发送成功/暂停/不确定/崩溃/超时。
++尚未验证：实际微信控件兼容、第三方库内部行为、真实云端认证/租约/回执、虚拟机后台运行。
++原版、修改记录、检查日志保存在 D 盘工作目录；成品只包含代码、说明、检查结果和源文件校验清单。
+--- original/CLOUD_API.md
++++ modified/CLOUD_API.md
+@@ -0,0 +1,42 @@
++# 云端接口约定
++
++Windows 只向 config.yaml 的 cloud.pull_url 发出 HTTPS POST，认证头 X-Token。
++云端必须校验 token，限制请求体大小，不把 token 写入公开日志。任务中禁止带命令或 Python 代码。
++
++## 拉取
++
++请求：
++```json
++{"action":"fetch","limit":10}
++```
++返回：
++```json
++{"ok":true,"items":[{"msgId":"order-123-reminder-1","group":"自动通知测试群-唯一名称","text":"测试通知","expiresAt":"2026-12-01T10:00:00Z"}]}
++```
++msgId/group/text 为非空字符串，msgId 全局唯一，重放保持同一 ID 与内容，禁止复用 ID 修改内容。
++expiresAt 推荐必填，ISO 8601 且带时区。未填时首次本地入队起默认一小时失效；它不能识别长期积压的云端旧任务，因此正式业务必须提供 expiresAt。
++云端应原子领取任务、归属固定发送器，并保留任务，直到得到确定回执。
++过期任务应停止下发。不要因为长时间没收到回执，就换 msgId 重新投递。
++
++## 回执
++
++请求：
++```json
++{"action":"ack","msgId":"order-123-reminder-1","ok":true,"error":""}
++```
++返回：
++```json
++{"ok":true}
++```
++成功/失败回执须幂等。ok=false 表示终止该任务，不得自动创建新 ID 重发。
++若云端超时，可重放原 msgId；本地 done/failed/expired 会补回执，不再发送。
++uncertain 不回执成功或失败，会保留人工核查状态；云端可能持续收到无回执，请将其展示为待核查而非自动重试新任务。
++目前接口没有服务端 hold 状态；如果你的后端支持，后续可增加 hold 回执降低轮询噪音。
++
++## 待联调清单
++
++1. 测试密钥错误时拒绝拉取、回执。
++2. 同一 ID 多次拉取只产生一次本地入队。
++3. 断网或回执失败时，云端重放原 ID。
++4. 超时/服务重启后，结果不确定任务不自动重发。
++5. 先测试群再正式群；配置唯一群名；一次只运行一个发送器。
+--- original/run-sender.bat
++++ modified/run-sender.bat
+@@ -1,13 +1,8 @@
+ @echo off
+-rem WeChat group sender service launcher (called by Task Scheduler)
+ cd /d "%~dp0"
+-
+-rem Guard: exit if an app.py pythonw instance is already running
+-powershell -NoProfile -Command "if (Get-CimInstance Win32_Process -Filter 'Name=''pythonw.exe''' | Where-Object { $_.CommandLine -match 'app\.py' }) { exit 1 }"
+-if errorlevel 1 (
+-    echo [run-sender] service already running, skip.
+-    ping -n 3 127.0.0.1 >nul
+-    exit /b 0
++if not exist ".venv\Scripts\pythonw.exe" (
++ echo Install Python and create .venv first.
++ pause
++ exit /b 1
+ )
+-
+-start "" .venv\Scripts\pythonw.exe -u app.py
++start "" ".venv\Scripts\pythonw.exe" -u app.py

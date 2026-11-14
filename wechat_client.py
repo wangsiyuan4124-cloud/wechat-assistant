@@ -1,13 +1,5 @@
 # -*- coding: utf-8 -*-
-"""微信发送客户端：双引擎
-
-- wcferry（hook，主力）：注入微信 3.9.12.51，API 级发送。
-  按 wxid 精确投递，天然零错群；最小化/锁屏均可发送。
-- wechatauto（RPA，备用）：UIA 控件树操作微信 4.x。
-  已加固：精确匹配 ChatRoom section + 严格名称校验 + 单条超时保护。
-
-config.yaml → wechat.engine: "wcferry" | "rpa"
-"""
+"""RPA adapter. One attempt only; requires a dedicated interactive desktop."""
 import threading
 import time
 
@@ -20,68 +12,10 @@ BASE = Path(__file__).resolve().parent
 def _engine_name():
     try:
         cfg = yaml.safe_load((BASE / "config.yaml").read_text(encoding="utf-8"))
-        return (cfg.get("wechat") or {}).get("engine", "wcferry")
+        return (cfg.get("wechat") or {}).get("engine", "rpa")
     except Exception:
-        return "wcferry"
+        return "rpa"
 
-
-class WcferryClient:
-    """hook 引擎：API 级收发，无 UI 依赖"""
-
-    def __init__(self, window_names=None, log=print):
-        self.log = log
-        self._wcf = None
-        self._lock = threading.Lock()
-
-    def _get(self):
-        if self._wcf is None:
-            from wcferry import Wcf
-            self._wcf = Wcf(debug=False)
-            self.log("[wcferry] 已注入微信，RPC 连接成功")
-        return self._wcf
-
-    def is_logged_in(self):
-        try:
-            with self._lock:
-                return bool(self._get().is_login())
-        except Exception as e:
-            self.log(f"[wcferry] 登录状态检测失败: {e}")
-            return False
-
-    def _room_id(self, group):
-        w = self._get()
-        for c in w.get_contacts():
-            if not str(getattr(c, "wxid", "")).endswith("@chatroom"):
-                continue
-            if group in (getattr(c, "name", ""), getattr(c, "remark", "")):
-                return c.wxid
-        return None
-
-    def send_to_group(self, group, text, retries=3):
-        last_err = None
-        for i in range(1, retries + 1):
-            try:
-                with self._lock:
-                    w = self._get()
-                    rid = self._room_id(group)
-                    if not rid:
-                        raise RuntimeError(
-                            f"联系人列表中找不到群「{group}」"
-                            f"（请确认本微信账号已在群内）")
-                    if not w.send_text(text, rid):
-                        raise RuntimeError("send_text 返回失败")
-                self.log(f"[wcferry] 已发送 → {group}（{rid}）")
-                return
-            except Exception as e:
-                last_err = str(e)
-                self.log(f"[wcferry] 第 {i}/{retries} 次发送失败: {last_err}")
-                time.sleep(2)
-        raise RuntimeError(f"发送到「{group}」重试 {retries} 次均失败: {last_err}")
-
-
-# =========================================================================
-# RPA 引擎：加固版
-# =========================================================================
 
 class RpaClient:
     """RPA 备用引擎：wechatauto UIA 操作微信 4.x
@@ -152,15 +86,14 @@ class RpaClient:
     def _ensure_chat(self, uia, group, timeout=10):
         """确保当前会话是目标群。加固版：强制 ChatRoom section + 严格名称校验。"""
         cur = uia.current_chat()
-        if cur == group:
-            return True
+        # Always search within group results, even if a same-named chat is open.
         self.log(f"[wechat] 当前会话={cur!r}，目标={group!r}，开始搜索")
 
         # 强制带 section='ChatRoom'——只在群聊结果里搜，绝不碰个人/系统账号
         try:
             ok = uia.open_chat(group, section="ChatRoom")
-        except TypeError:
-            ok = uia.open_chat(group)
+        except TypeError as e:
+            raise RuntimeError('依赖不支持群类型过滤，停止发送') from e
 
         if not ok:
             self.log(f"[wechat] 搜索返回 False，找不到 ChatRoom 匹配的「{group}」")
@@ -180,11 +113,11 @@ class RpaClient:
 
     # ---------- send_to_group ----------
 
-    def send_to_group(self, group, text, retries=3):
+    def send_to_group(self, group, text, retries=1):
         """发送文本到指定群。加固：ChatRoom section + exact name 强校验。
 
         注意：UIA COM 必须在同一个线程里 Initialize + 使用，
-        所以这里**不做线程隔离**。硬超时由调用方的 watcher stuck reset 兜底。
+        所以这里**不做线程隔离**。硬超时由父进程终止发送子进程处理。
         """
         gui, uia = self._engine()
         from wechatauto.param import WxParam
@@ -225,18 +158,16 @@ class RpaClient:
 
 
 def com_init():
-    if _engine_name() == "wcferry":
-        return
     try:
         import uiautomation as auto
         auto.InitializeUIAutomationInCurrentThread()
-    except Exception:
-        pass
+    except Exception as e:
+        raise RuntimeError('UIA 初始化失败') from e
 
 
 def make_client(window_names=None, log=print):
     engine = _engine_name()
     log(f"[engine] 使用 {engine} 引擎")
-    if engine == "wcferry":
-        return WcferryClient(log=log)
+    if engine != 'rpa':
+        raise RuntimeError('仅启用 RPA，Hook 未验证')
     return RpaClient(window_names=window_names, log=log)

@@ -1,0 +1,17 @@
+test_ambiguous_is_held (__main__.DeliveryTests.test_ambiguous_is_held) ... ok
+test_crash_is_held (__main__.DeliveryTests.test_crash_is_held) ... ok
+test_expired_not_dispatched (__main__.DeliveryTests.test_expired_not_dispatched) ... ok
+test_legacy_without_expiry_not_dispatched (__main__.DeliveryTests.test_legacy_without_expiry_not_dispatched) ... ok
+test_success (__main__.DeliveryTests.test_success) ... ok
+test_timeout_kills_process_and_holds (__main__.DeliveryTests.test_timeout_kills_process_and_holds) ... ok
+test_unapproved_group_not_dispatched (__main__.DeliveryTests.test_unapproved_group_not_dispatched) ... ok
+test_window_unavailable_is_deferred (__main__.DeliveryTests.test_window_unavailable_is_deferred) ... ok
+test_cloud_replay_does_not_requeue_done (__main__.QueueTests.test_cloud_replay_does_not_requeue_done) ... ok
+test_invalid_message_rejected (__main__.QueueTests.test_invalid_message_rejected) ... ok
+test_migration_preserves_old_queue (__main__.QueueTests.test_migration_preserves_old_queue) ... ok
+test_restart_holds_ambiguous_send (__main__.QueueTests.test_restart_holds_ambiguous_send) ... ok
+
+----------------------------------------------------------------------
+Ran 12 tests in 1.250s
+
+OK

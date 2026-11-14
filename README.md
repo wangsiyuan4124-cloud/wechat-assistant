@@ -1,120 +1,62 @@
-# wechat-assistant
+# 微信群发送服务：本地加固版
 
-Windows 本机运行的**微信群消息自动发送服务**（只发不收）。业务侧在云端生成待发消息，本机定时拉取并通过微信客户端投递到指定群，然后回执云端。
+基于 wangsiyuan4124-cloud/wechat-assistant，原始提交 a2703ab860d81d5bc2a43b215aa556150d603317。
 
-## 架构
+## 当前完成情况
 
-```
-业务触发（小程序 / 云端定时扫描）
-        ↓
-云函数 push-wechat  →  云数据库 wechat_outbox
-        ↓  （本机主动轮询，无需公网入口）
-本机 pull-wechat 拉取
-        ↓
-本地 SQLite 队列（queue.db）
-        ↓
-微信客户端发送（wcferry hook 或 wechatauto UIA）
-        ↓
-ack 回执云端
-```
+已完成本地代码修改与 12 项模拟测试；没有安装微信自动化依赖、启动微信或发送真实消息。未修改远端仓库。此包是待联调版本，不是已上线服务。
 
-三个后台线程：
+## 使用环境
 
-| 线程 | 职责 |
-|---|---|
-| `poll_loop` | 按 `poll_interval_sec` 轮询云端，把待发消息入本地队列（msg_id 幂等去重） |
-| `worker_loop` | 串行消费队列；失败退避重试 10s/60s/180s/300s，微信离线类错误快速失败 |
-| `watcher_loop` | 每 60s 检查微信在线状态、自动还原/拉起微信窗口、重置卡死超过 120s 的 sending 记录 |
+推荐独立 Windows 电脑或 Windows 虚拟机。只启用 RPA，Hook 分支不作为交付能力。
+正常发送仍会操作会话和输入框，可能影响焦点/剪贴板。后台运行 Python 不等于微信无界面操作。
+预检查要求微信主窗口可见、非最小化且桌面未锁定；不满足时等待直到任务过期。
+预检查为保守判断，部分微信版本可能不通过，需要本机联调，不能直接绕过检查。
+程序不自动启动、移动、还原或置顶微信。依赖库在正常发送时仍可能激活窗口。
+请给目标群设置唯一名称；RPA 按名称校验无法彻底排除同名会话，不承诺零错群。
 
-## 环境要求
+## 安装与启动（在专用运行环境执行）
 
-- Windows 10/11
-- Python 3.10+（建议 3.12）
-- 已登录的微信桌面客户端
-  - `engine: wcferry` → 需要微信 **3.9.12.x**（API 级注入，不依赖窗口可见，最稳）
-  - `engine: rpa` → 支持微信 4.x（UIA 操作，**要求微信主窗口保持可见、不最小化**）
-
-## 安装
+安装 Python 3.12，然后在项目目录运行：
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-## 配置
-
-```powershell
 Copy-Item config.example.yaml config.yaml
-```
-
-然后编辑 `config.yaml`，至少填写：
-
-| 字段 | 说明 |
-|---|---|
-| `cloud.pull_url` | 云函数 HTTP 触发器地址 |
-| `cloud.token` | 与云端 `SENDER_TOKEN` 环境变量一致；**不要提交真实值** |
-| `wechat.engine` | `wcferry` 或 `rpa` |
-| `wechat.groups` | 群白名单，只允许向这些群发送 |
-| `watch.wechat_exe` | 微信可执行文件路径（用于掉线自动拉起） |
-| `alerts.wechat_work_webhook` | 可选，企业微信群机器人 webhook，留空则只写日志 |
-
-`config.yaml` 已加入 `.gitignore`，不会被提交。
-
-## 启动
-
-```powershell
-# 前台调试（可见输出）
+# 编辑 config.yaml：接口地址、随机密钥、唯一群名、发送超时和有效期
 .\.venv\Scripts\python.exe -u app.py
-
-# 后台运行（无窗口）
-start "" .venv\Scripts\pythonw.exe -u app.py
 ```
 
-或直接双击 `run-sender.bat`（内部含单实例检查）。
+先以前台模式在测试群验证；验证后可以双击 run-sender.bat 后台运行。未配置自动启动项。
+依赖版本尚未在本机验证，requirements.txt 中的范围不代表兼容性保证；联调后需固定实际版本。
 
-开机自启：把 `run-sender.bat` 的快捷方式放入
-`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`。
-不再需要时把该 `.lnk` 重命名为 `.lnk.disabled` 即可，不必删除。
+## 状态与故障处理
 
-## 运行时文件位置
+- pending：等待处理；桌面不可操作时保留等待。
+- sending：独立子进程正在尝试，默认 45 秒超时。
+- done：UI 发送函数返回成功，不代表对方收到或阅读。
+- uncertain：发送异常、子进程超时/退出或服务中断，禁止自动重发。
+- expired：过期或历史任务缺少有效期，不发送。
+- failed：白名单等明确拒绝。
 
-| 文件 | 路径 | 说明 |
-|---|---|---|
-| 消息队列 | `./queue.db` | SQLite，表 `messages`（`msg_id / grp / text / status / error / created_at / updated_at`） |
-| 服务日志 | `./service.log` | 主日志，含入队/发送/失败记录 |
-| 健康快照 | `./health.log` | `health-watch.py` 每 5 分钟追加 |
-| 微信自动化日志 | `./wechatauto_logs/` | wechatauto 引擎自动生成 |
-| 单实例锁 | `./.app.pid.lock` | 进程退出后为僵尸锁，可直接删除 |
+重启将 sending 转为 uncertain。msgId 是入队去重键，不能实现端到端严格只发送一次。
+出现 uncertain 后先停服务，查看 queue.db、service.log、runtime/sender.log 和微信群实际记录。
+确认已发：备份 queue.db 后将对应记录设为 done；下次云端重放时补成功回执。
+确认取消：设为 failed；下次重放时补失败回执。
+确认未发且确需重试：由业务端明确创建新的 msgId 与 expiresAt，原任务设为 failed；不要直接删除旧记录。
+没有证据时保留 uncertain。不要删除 queue.db，否则会丢失去重与核查记录。
 
-队列状态机：`pending → sending → done | failed`。
-服务重启时会把残留的 `sending` 重置为 `pending` 续发（业务侧需容忍极少数重复发送）。
+## 云端连接
+
+见 CLOUD_API.md。云端服务未包含在原仓库，也未在此包部署。
+必须采用单发送器归属：多台机器使用同一账号/队列会破坏本地去重假设。
+
+## 检查
 
 ```powershell
-# 查看队列概况
-.\.venv\Scripts\python.exe -c "import store;print(store.queue_depth())"
+python -B test_safety.py
 ```
 
-## 健康监控
-
-```powershell
-.\.venv\Scripts\pythonw.exe -u health-watch.py
-```
-
-每 5 分钟往 `health.log` 写一条快照：进程 PID、微信窗口可见性、队列计数、最近 WARNING。
-
-## 已知限制
-
-- **RPA 引擎依赖窗口可见**：微信被最小化或在离屏坐标时 UIA 看不到控件，发送会失败。服务内已做自动还原（`ShowWindow` + `SW_RESTORE`），但锁屏仍会导致失败，需保持不锁屏。
-- **微信 4.x 的 Qt6 会丢失 `WS_VISIBLE` 样式位**：窗口看着在屏幕上但 `IsWindowVisible=False`，`_restore_wechat_window()` 已修复该情况。
-- `wcferry` 仅支持微信 3.9.12.x，4.x 无法注入。
-- 群名必须与微信群列表中的名称完全一致（白名单 + 精确匹配双重校验，防止发错群）。
-
-## 可选：内网穿透（旧方案）
-
-`optional/frp/` 下保留了早期「云端反向推送」架构所需的 frps 部署脚本与客户端配置样例。当前默认的轮询架构**不需要**它。
-
-## 安全说明
-
-- 仓库内所有 token / webhook / 服务器地址均为占位符，请自行填写。
-- 群白名单 + 精确会话校验，避免误发到非目标群。
-- `msg_id` 幂等，云端超时重放不会造成本地重复入队。
+测试不导入微信引擎、不连接云端、不发送微信，覆盖去重、重启保留、历史数据库迁移、过期、白名单、模拟发送成功/暂停/不确定/崩溃/超时。
+尚未验证：实际微信控件兼容、第三方库内部行为、真实云端认证/租约/回执、虚拟机后台运行。
+原版、修改记录、检查日志保存在 D 盘工作目录；成品只包含代码、说明、检查结果和源文件校验清单。

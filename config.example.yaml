@@ -1,28 +1,15 @@
 cloud:
-  # pull-wechat 云函数的 HTTP 触发器地址（替换成你自己的环境地址）
-  pull_url: "https://<your-env-id>.service.tcloudbase.com/pull-wechat"
-  # 与 pull-wechat 环境变量 SENDER_TOKEN 一致（自行生成一个随机串填这里）
-  token: "<REPLACE_WITH_YOUR_SENDER_TOKEN>"
+  pull_url: "https://YOUR-HOST/pull-wechat"
+  token: "REPLACE_WITH_RANDOM_SECRET"
   poll_interval_sec: 15
-
 wechat:
-  # 发送引擎：wcferry = hook 注入微信 3.9.12.x（API 级，零错群，不依赖窗口）
-  #           rpa     = wechatauto UIA 操作微信 4.x（依赖窗口可见）
   engine: "rpa"
-  window_names: ["微信", "WeChat"]
-  # 群名白名单：只允许向这些群发消息（改成你的真实群名）
   groups:
-    - "文件传输助手"
-    - "测试群（改成你的群名）"
-
+    - "自动通知测试群-唯一名称"
+delivery:
+  send_timeout_sec: 45
+  default_ttl_sec: 3600
 watch:
   interval_sec: 60
-  # 微信进程守护：进程不在时自动拉起（改成本机微信可执行文件路径）
-  auto_restart_wechat: true
-  wechat_exe: "C:\\Program Files\\Tencent\\Weixin\\Weixin.exe"
-  # sending 状态超过多少秒视为卡死，强制重置为 pending
-  stuck_threshold_sec: 120
-
 alerts:
-  # 备用告警：企业微信群机器人 webhook，掉线/失败时通知；留空则只写日志
   wechat_work_webhook: ""
