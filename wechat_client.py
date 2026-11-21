@@ -217,17 +217,6 @@ class AgentDesktopClient:
     def _press(self, key):
         self._run(["press", key, "--app", self.APP, "--headed"], timeout=10)
 
-    def _restore(self):
-        """把微信窗口放回可见区（agent-desktop 能读 offscreen 树但不能操作，操作前必须 restore）。"""
-        try:
-            self._run(["restore", "--app", self.APP], timeout=10, require_ok=False)
-        except Exception:
-            pass
-        try:
-            self._run(["move-window", "--app", self.APP, "--x", "0", "--y", "0"], timeout=10, require_ok=False)
-        except Exception:
-            pass
-
     def _verify_current_chat(self, expected):
         """点完搜索结果后，验证当前真的进入了 expected 会话。
 
@@ -262,7 +251,8 @@ class AgentDesktopClient:
     def send_to_group(self, group, text, retries=2):
         """发送文本到指定群。"""
         self.log(f"[agent-desktop] 开始发群「{group}」")
-        self._restore()
+        # 注意：agent-desktop 通过 UIA semantic API 操作，不需要窗口可见/前置。
+        # 微信可以最小化到托盘，照样能 click/type/press。
 
         last_err = None
         for attempt in range(1, retries + 1):
