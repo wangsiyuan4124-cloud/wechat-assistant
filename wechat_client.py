@@ -155,7 +155,61 @@ class AgentDesktopClient:
         self._run(["click", ref, "--headed"], timeout=10)
 
     def _type(self, ref, text):
-        self._run(["type", ref, text, "--headed"], timeout=15)
+        """往输入框填文本。
+
+        agent-desktop 的 type 命令会把 \\n 当普通字符吞掉，导致多行消息挤成一团。
+        所以改用 Windows 剪贴板 + ctrl+v 粘贴，和 RPA 引擎效果一致，能保留换行和 emoji。
+        """
+        self._paste_clipboard(text)
+        # 用 click 聚焦输入框（但 click 后可能焦点丢失，所以用 press 先点再 v）
+        self._run(["click", ref, "--headed"], timeout=10)
+        import time
+        time.sleep(0.15)  # 等焦点到位
+        self._press("ctrl+v")
+
+    @staticmethod
+    def _paste_clipboard(text):
+        """把文本写入 Windows 剪贴板（UTF-16），支持换行和 emoji。"""
+        import subprocess
+        # PowerShell Set-Clipboard 原生支持多行 + emoji，比 ctypes 稳
+        # 用 -Raw 读 stdin，避免命令行转义吞换行
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "$input | Set-Clipboard"],
+                input=text, capture_output=True, timeout=5, encoding="utf-8"
+            )
+            return
+        except Exception:
+            pass  # PowerShell 失败就退回 ctypes
+
+        # 兜底：ctypes 直接调 Win32 API（简单版，不加 GMEM_ZEROINIT 避免 int 溢出）
+        import ctypes
+        from ctypes import wintypes
+
+        CF_UNICODETEXT = 13
+        GMEM_MOVEABLE = 0x0002
+
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+
+        data = (text + "\0").encode("utf-16-le")
+        size = len(data)
+        h_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, ctypes.c_size_t(size))
+        if not h_mem:
+            raise RuntimeError(f"GlobalAlloc 失败 (size={size})")
+        buf = kernel32.GlobalLock(h_mem)
+        ctypes.memmove(buf, data, size)
+        kernel32.GlobalUnlock(h_mem)
+
+        if not user32.OpenClipboard(0):
+            kernel32.GlobalFree(h_mem)
+            raise RuntimeError("OpenClipboard 失败")
+        user32.EmptyClipboard()
+        user32.SetClipboardData(CF_UNICODETEXT, h_mem)  # 剪贴板接管内存
+        user32.CloseClipboard()
 
     def _clear(self, ref):
         self._run(["clear", ref, "--headed"], timeout=10)
