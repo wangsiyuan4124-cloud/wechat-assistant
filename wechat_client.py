@@ -131,7 +131,7 @@ class AgentDesktopClient:
 
     def _find(self, role=None, name=None, text=None, exact=False):
         """在 UI 树里查找元素，返回 ref 字符串（如 '@s1aq3c386zbesu:e1'）。"""
-        args = ["find", "--app", self.APP, "-i"]
+        args = ["find", "--app", self.APP]
         if role:
             args += ["--role", role]
         if name:
@@ -143,19 +143,20 @@ class AgentDesktopClient:
         data = self._run(args, timeout=10, require_ok=False)
         if not data.get("ok"):
             return None
-        results = data.get("results") or []
-        if not results:
+        inner = data.get("data") or {}
+        matches = inner.get("matches") or []
+        if not matches:
             return None
-        return results[0].get("ref")
+        return matches[0].get("ref_id")
 
     def _click(self, ref):
-        self._run(["click", ref, "--app", self.APP, "--headed"], timeout=10)
+        self._run(["click", ref, "--headed"], timeout=10)
 
     def _type(self, ref, text):
-        self._run(["type", ref, text, "--app", self.APP, "--headed"], timeout=15)
+        self._run(["type", ref, text, "--headed"], timeout=15)
 
     def _clear(self, ref):
-        self._run(["clear", ref, "--app", self.APP, "--headed"], timeout=10)
+        self._run(["clear", ref, "--headed"], timeout=10)
 
     def _press(self, key):
         self._run(["press", key, "--app", self.APP, "--headed"], timeout=10)
@@ -413,3 +414,16 @@ def make_client(window_names=None, log=print):
     if engine == "rpa":
         return RpaClient(window_names=window_names, log=log)
     raise RuntimeError(f"未知引擎: {engine}")
+
+
+def com_init():
+    """wechatauto UIA 的 COM 初始化（只给 RpaClient 用）。
+
+    agent-desktop / wcferry 不需要 COM 初始化，所以这个函数是空壳。
+    保留它是因为 send_once.py 会 import com_init，即使 agent-desktop 不走 rpa 分支。
+    """
+    try:
+        import uiautomation as auto
+        auto.InitializeUIAutomationInCurrentThread()
+    except Exception:
+        pass
