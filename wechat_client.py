@@ -129,7 +129,7 @@ class AgentDesktopClient:
     def _snapshot(self):
         return self._run(["snapshot", "--app", self.APP, "-i"], timeout=20)
 
-    def _find(self, role=None, name=None, text=None, exact=False):
+    def _find(self, role=None, name=None, text=None, exact=False, native_id=None):
         """在 UI 树里查找元素，返回 ref 字符串（如 '@s1aq3c386zbesu:e1'）。"""
         args = ["find", "--app", self.APP]
         if role:
@@ -140,6 +140,8 @@ class AgentDesktopClient:
             args += ["--text", text]
         if exact:
             args += ["--exact"]
+        if native_id:
+            args += ["--native-id", native_id]
         data = self._run(args, timeout=10, require_ok=False)
         if not data.get("ok"):
             return None
@@ -171,6 +173,19 @@ class AgentDesktopClient:
             self._run(["move-window", "--app", self.APP, "--x", "0", "--y", "0"], timeout=10, require_ok=False)
         except Exception:
             pass
+
+    def _verify_current_chat(self, expected):
+        """点完搜索结果后，验证当前真的进入了 expected 会话。
+
+        做法：群聊界面的输入框 role=textfield 且 name=目标群名，直接搜它。
+        """
+        try:
+            ref = self._find(role="textfield", name=expected, exact=True)
+            self.log(f"[agent-desktop] 输入框 ref={ref}, 目标群={expected!r}")
+            return ref is not None
+        except Exception as e:
+            self.log(f"[agent-desktop] 验证当前会话异常: {e}")
+            return False
 
     # ---------- 对外接口 ----------
 
@@ -231,18 +246,20 @@ class AgentDesktopClient:
         except Exception:
             pass
         self._type(search_ref, group)
-        time.sleep(1.5)  # 等搜索结果
+        time.sleep(0.3)
+        # 必须按回车触发微信搜索！SetValue 不会自动弹出搜索结果下拉
+        self._press("return")
+        time.sleep(1.5)  # 等搜索结果加载
 
-        # 4. 找搜索结果里的群项（先查 option，再查 button）
+        # 4. 找搜索结果里的群项（优先用 native_id 精准定位，兜底用 text 模糊匹配）
         result_ref = None
+        # native_id 格式：session_item_群名（微信搜索结果列表里的唯一 ID）
+        native_id = f"session_item_{group}"
         for _ in range(10):
-            # 搜索结果里群项是 role=option（不是 button），且 name 可能把高亮文本拼两遍
-            # 所以只按 text 模糊匹配群名的前几个字
-            prefix = group[:3] if len(group) >= 3 else group
             result_ref = (
-                self._find(role="option", text=prefix)
-                or self._find(role="option", name=prefix)
-                or self._find(role="button", text=prefix)
+                self._find(native_id=native_id)
+                or self._find(role="option", text=group, exact=True)
+                or self._find(role="option", name=group, exact=True)
             )
             if result_ref:
                 break
@@ -253,17 +270,17 @@ class AgentDesktopClient:
 
         self.log(f"[agent-desktop] 找到群项 ref={result_ref}，点击进入")
         self._click(result_ref)
-        time.sleep(1.0)
-
-        # 5. 找输入框（群会话里唯一的 textfield）
+        # 微信从搜索结果界面切到群聊界面需要 2-3 秒，等够再验证
         input_ref = None
-        for _ in range(5):
-            input_ref = self._find(role="textfield")
+        for wait_s in (0.5, 1.0, 2.0, 3.0):
+            time.sleep(wait_s)
+            input_ref = self._find(role="textfield", name=group, exact=True)
             if input_ref:
                 break
-            time.sleep(0.3)
         if not input_ref:
-            raise RuntimeError("进入群后找不到输入框")
+            raise RuntimeError(
+                f"点击搜索结果后 3 秒内未能进入「{group}」群聊界面（输入框未出现），已停止发送以防发错人"
+            )
 
         self.log(f"[agent-desktop] 已进入「{group}」，输入框 ref={input_ref}")
 
