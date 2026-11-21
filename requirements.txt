@@ -1,7 +1,15 @@
-uiautomation>=2.0.20
-pyperclip>=1.8
+# === Python 依赖 ===
 pyyaml>=6.0
 requests>=2.28
-wechatauto-replica
-pillow
-pyautogui
+
+# === 可选引擎依赖（根据 config.yaml wechat.engine 选装） ===
+# engine: "agent-desktop"  ← 推荐，Vercel Labs CLI（npm 包，pip 管不到，单独装）
+#   npm install -g agent-desktop --allow-scripts=agent-desktop
+#
+# engine: "rpa"  ← 历史方案（wechatauto UIA，微信 4.x，窗口必须可见）
+#   wechatauto-replica
+#   uiautomation>=2.0.20
+#   pyperclip>=1.8
+#
+# engine: "wcferry"  ← 微信 3.9.12.x hook 注入
+#   wcferry

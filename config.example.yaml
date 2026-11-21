@@ -3,7 +3,13 @@ cloud:
   token: "REPLACE_WITH_RANDOM_SECRET"
   poll_interval_sec: 15
 wechat:
-  engine: "rpa"
+  # 发送引擎（按稳定性从高到低）：
+  #   agent-desktop = Vercel Labs 开源 CLI（npm install -g agent-desktop --allow-scripts=agent-desktop）
+  #                   原生 Rust + Windows UI Automation，读 UI 树不关心窗口离屏/最小化，
+  #                   发送前自动 restore + move-window 把微信放回可见区。推荐默认。
+  #   wcferry        = hook 注入微信 3.9.12.x（API 级，零错群，不依赖窗口，需 wcferry 版本匹配）
+  #   rpa            = wechatauto UIA 操作微信 4.x（历史方案，窗口被最小化就崩，已不推荐）
+  engine: "agent-desktop"
   groups:
     - "自动通知测试群-唯一名称"
 delivery:

@@ -1,10 +1,22 @@
 # -*- coding: utf-8 -*-
-"""RPA adapter. One attempt only; requires a dedicated interactive desktop."""
+"""微信发送引擎：RPA（wechatauto）/ agent-desktop CLI / Wcferry。
+
+选哪个由 config.yaml wechat.engine 决定。
+- agent-desktop：Vercel Labs 开源 CLI（npm install -g agent-desktop），
+  原生 Rust + Windows UI Automation，读 UI 树不关心窗口离屏/最小化。
+- wcferry：微信 3.9.12.x hook 注入（API 级，零错群，不依赖窗口）。
+- rpa：wechatauto UIA 操作微信 4.x（历史方案，窗口被最小化就崩）。
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
 import threading
 import time
+from pathlib import Path
 
 import yaml
-from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
 
@@ -12,22 +24,265 @@ BASE = Path(__file__).resolve().parent
 def _engine_name():
     try:
         cfg = yaml.safe_load((BASE / "config.yaml").read_text(encoding="utf-8"))
-        return (cfg.get("wechat") or {}).get("engine", "rpa")
+        return (cfg.get("wechat") or {}).get("engine", "agent-desktop")
     except Exception:
-        return "rpa"
+        return "agent-desktop"
 
+
+# ---------------------------------------------------------------------------
+# 公共工具
+# ---------------------------------------------------------------------------
+
+def _run(cmd, timeout=15, log=None):
+    """subprocess 执行命令，捕获 stdout/stderr 返回文本。"""
+    if log:
+        log(f"[cmd] {' '.join(cmd)}")
+    try:
+        p = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        out = (p.stdout or "") + (p.stderr or "")
+        if p.returncode != 0:
+            raise RuntimeError(f"exit={p.returncode}: {out.strip()[:200]}")
+        return out.strip()
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"命令超时 {timeout}s: {' '.join(cmd)}")
+
+
+def _cli_path(name):
+    """优先找原生 exe，再回退 PATH 里的 shim。"""
+    p = Path(shutil.which(name) or "")
+    if p.suffix.lower() in (".exe", ""):
+        # npm -g 的 shim 是无扩展名，Windows 下 subprocess 不能直接跑
+        if p.suffix == "" and p.name == name:
+            candidate = p.parent / f"{name}.cmd"
+            if candidate.exists():
+                return str(candidate)
+        return str(p) if p.exists() else None
+    # 优先 npm 全局原生二进制路径
+    for suffix in ("-win32-x64.exe", "-win32-arm64.exe", ".exe"):
+        npm_root = Path(os.environ.get("APPDATA", "")) / "npm"
+        candidate = npm_root / "node_modules" / name / "bin" / f"{name}{suffix}"
+        if candidate.exists():
+            return str(candidate)
+    return str(p) if p.exists() else None
+
+
+def _json_of(text):
+    """从 agent-desktop 输出里提取最后一个 JSON 对象（前面可能有日志行）。"""
+    if not text:
+        return {}
+    # 尝试直接 parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # 从后往前找第一个 { ... } 块
+    m = re.search(r"\{[\s\S]+\}", text)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# AgentDesktopClient —— Vercel Labs agent-desktop CLI
+# ---------------------------------------------------------------------------
+
+class AgentDesktopClient:
+    """基于 agent-desktop CLI 的微信发送引擎（推荐）。
+
+    原理：
+    - agent-desktop 是 Vercel Labs 开源的 Windows/macOS 桌面自动化 CLI（Rust 写的）
+    - 通过 Windows UI Automation 读 UI 树，**不依赖窗口可见性**
+    - agent-desktop CLI 安装：npm install -g agent-desktop --allow-scripts=agent-desktop
+      （npm 的 allow-scripts 在 npm>=10 上才能放行 postinstall 编译原生二进制）
+    """
+
+    APP = "Weixin"  # 进程名，agent-desktop 用这个定位应用
+
+    def __init__(self, window_names=None, log=print):
+        self.log = log
+        bin_path = _cli_path("agent-desktop")
+        if not bin_path:
+            raise RuntimeError(
+                "找不到 agent-desktop CLI，请先安装："
+                "npm install -g agent-desktop --allow-scripts=agent-desktop"
+            )
+        self._cli = bin_path
+        self.log(f"[agent-desktop] 二进制: {self._cli}")
+
+    # ---------- 底层命令 ----------
+
+    def _run(self, args, timeout=15, require_ok=True):
+        cmd = [self._cli, *args]
+        out = _run(cmd, timeout=timeout, log=self.log)
+        data = _json_of(out)
+        if require_ok and data.get("ok") is False:
+            err = data.get("error") or out[:200]
+            raise RuntimeError(f"agent-desktop 命令失败: {err}")
+        return data
+
+    def _snapshot(self):
+        return self._run(["snapshot", "--app", self.APP, "-i"], timeout=20)
+
+    def _find(self, role=None, name=None, text=None, exact=False):
+        """在 UI 树里查找元素，返回 ref 字符串（如 '@s1aq3c386zbesu:e1'）。"""
+        args = ["find", "--app", self.APP, "-i"]
+        if role:
+            args += ["--role", role]
+        if name:
+            args += ["--name", name]
+        if text:
+            args += ["--text", text]
+        if exact:
+            args += ["--exact"]
+        data = self._run(args, timeout=10, require_ok=False)
+        if not data.get("ok"):
+            return None
+        results = data.get("results") or []
+        if not results:
+            return None
+        return results[0].get("ref")
+
+    def _click(self, ref):
+        self._run(["click", ref, "--app", self.APP, "--headed"], timeout=10)
+
+    def _type(self, ref, text):
+        self._run(["type", ref, text, "--app", self.APP, "--headed"], timeout=15)
+
+    def _clear(self, ref):
+        self._run(["clear", ref, "--app", self.APP, "--headed"], timeout=10)
+
+    def _press(self, key):
+        self._run(["press", key, "--app", self.APP, "--headed"], timeout=10)
+
+    def _restore(self):
+        """把微信窗口放回可见区（agent-desktop 能读 offscreen 树但不能操作，操作前必须 restore）。"""
+        try:
+            self._run(["restore", "--app", self.APP], timeout=10, require_ok=False)
+        except Exception:
+            pass
+        try:
+            self._run(["move-window", "--app", self.APP, "--x", "0", "--y", "0"], timeout=10, require_ok=False)
+        except Exception:
+            pass
+
+    # ---------- 对外接口 ----------
+
+    def is_logged_in(self):
+        """Weixin.exe 进程活着就算在线。"""
+        try:
+            data = self._run(["list-apps"], timeout=10, require_ok=False)
+            apps = data.get("apps") or data.get("applications") or []
+            for a in apps:
+                name = (a.get("name") or a.get("id") or "").lower()
+                if "weixin" in name or "wechat" in name:
+                    return True
+            # 兜底：tasklist
+            out = _run(["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/NH", "/FO", "CSV"], timeout=5)
+            return "Weixin.exe" in out
+        except Exception as e:
+            self.log(f"[agent-desktop] is_logged_in 检查失败: {e}")
+            return False
+
+    def send_to_group(self, group, text, retries=2):
+        """发送文本到指定群。"""
+        self.log(f"[agent-desktop] 开始发群「{group}」")
+        self._restore()
+
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                self._send_once(group, text)
+                self.log(f"[agent-desktop] 已发送 → {group}")
+                return
+            except Exception as e:
+                last_err = str(e)
+                self.log(f"[agent-desktop] 第 {attempt}/{retries} 次失败: {last_err}")
+                time.sleep(3)
+        raise RuntimeError(f"agent-desktop 发送「{group}」重试 {retries} 次均失败: {last_err}")
+
+    def _send_once(self, group, text):
+        """单次发送流程。"""
+        # 1. 点击左侧"微信"tab 回到聊天列表
+        wechat_tab = self._find(role="button", name="微信", exact=True)
+        if wechat_tab:
+            self._click(wechat_tab)
+            time.sleep(0.5)
+
+        # 2. 点击搜索框
+        search_ref = self._find(role="textfield", name="搜索", exact=True)
+        if not search_ref:
+            # 兜底：按角色模糊
+            search_ref = self._find(role="textfield")
+        if not search_ref:
+            raise RuntimeError("找不到微信搜索框")
+        self._click(search_ref)
+        time.sleep(0.3)
+
+        # 3. 清空 + 输入群名
+        try:
+            self._clear(search_ref)
+        except Exception:
+            pass
+        self._type(search_ref, group)
+        time.sleep(1.5)  # 等搜索结果
+
+        # 4. 找搜索结果里的群项（先查 option，再查 button）
+        result_ref = None
+        for _ in range(10):
+            # 搜索结果里群项是 role=option（不是 button），且 name 可能把高亮文本拼两遍
+            # 所以只按 text 模糊匹配群名的前几个字
+            prefix = group[:3] if len(group) >= 3 else group
+            result_ref = (
+                self._find(role="option", text=prefix)
+                or self._find(role="option", name=prefix)
+                or self._find(role="button", text=prefix)
+            )
+            if result_ref:
+                break
+            time.sleep(0.3)
+
+        if not result_ref:
+            raise RuntimeError(f"搜索「{group}」未出现匹配结果")
+
+        self.log(f"[agent-desktop] 找到群项 ref={result_ref}，点击进入")
+        self._click(result_ref)
+        time.sleep(1.0)
+
+        # 5. 找输入框（群会话里唯一的 textfield）
+        input_ref = None
+        for _ in range(5):
+            input_ref = self._find(role="textfield")
+            if input_ref:
+                break
+            time.sleep(0.3)
+        if not input_ref:
+            raise RuntimeError("进入群后找不到输入框")
+
+        self.log(f"[agent-desktop] 已进入「{group}」，输入框 ref={input_ref}")
+
+        # 6. 粘贴文本 + 回车发送
+        try:
+            self._clear(input_ref)
+        except Exception:
+            pass
+        self._type(input_ref, text)
+        time.sleep(0.5)
+        self._press("return")
+        time.sleep(1.0)
+
+
+# ---------------------------------------------------------------------------
+# RpaClient —— wechatauto UIA（历史方案，窗口被最小化就崩）
+# ---------------------------------------------------------------------------
 
 class RpaClient:
-    """RPA 备用引擎：wechatauto UIA 操作微信 4.x
-
-    加固点：
-    1. open_chat 强制加 section='ChatRoom' 过滤——只在群聊里搜，绝不碰个人会话/系统账号
-    2. open_chat 返回后强校验 exact name——搜索可能返回近似结果，必须轮询到完全匹配
-    3. send_text 重试从 2 次升到 3 次
-    4. **不靠 ThreadPoolExecutor 做硬超时**——UIA COM 是线程亲和的（STA 模型），
-       必须在 InitializeUIAutomationInCurrentThread 的同一个线程里使用。
-       硬超时由每个步骤内部的 timeout 参数 + watcher 的 stuck reset 兜底。
-    """
+    """RPA 备用引擎：wechatauto UIA 操作微信 4.x"""
 
     def __init__(self, window_names=None, log=print):
         self.window_names = list(window_names or ("微信", "WeChat"))
@@ -36,24 +291,21 @@ class RpaClient:
         self._uia = None
 
     def _engine(self):
-        """惰性创建 UIA 引擎；不可用时抛错（绝不降级 OCR）。"""
         if self._gui is None:
             from wechatauto.guia import WeChatGUI
             self._gui = WeChatGUI()
         if self._uia is None:
             self._uia = self._gui._get_uia()
         if self._uia is None:
-            raise RuntimeError("UIA 引擎不可用（无障碍门热激活失败），按安全策略中止发送")
+            raise RuntimeError("UIA 引擎不可用（无障碍门热激活失败）")
         return self._gui, self._uia
 
     def is_logged_in(self):
-        """微信进程存活 + 窗口可见性 OK 视为在线。"""
         import ctypes
         import subprocess
         from ctypes import wintypes
         user32 = ctypes.windll.user32
 
-        # 进程活
         def has(image):
             r = subprocess.run(
                 ["tasklist", "/FI", f"IMAGENAME eq {image}", "/NH"],
@@ -65,7 +317,6 @@ class RpaClient:
         if not (has("Weixin.exe") or has("WeChat.exe")):
             return False
 
-        # 窗口可见——兼容 Qt6 丢失 WS_VISIBLE 样式位的场景
         hits = []
         CB = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         def cb(hwnd, _):
@@ -81,93 +332,84 @@ class RpaClient:
         user32.EnumWindows(CB(cb), 0)
         return len(hits) > 0
 
-    # ---------- 加固版 open_chat ----------
-
     def _ensure_chat(self, uia, group, timeout=10):
-        """确保当前会话是目标群。加固版：强制 ChatRoom section + 严格名称校验。"""
         cur = uia.current_chat()
-        # Always search within group results, even if a same-named chat is open.
-        self.log(f"[wechat] 当前会话={cur!r}，目标={group!r}，开始搜索")
-
-        # 强制带 section='ChatRoom'——只在群聊结果里搜，绝不碰个人/系统账号
+        self.log(f"[wechat] 当前会话={cur!r}，目标={group!r}")
         try:
             ok = uia.open_chat(group, section="ChatRoom")
         except TypeError as e:
-            raise RuntimeError('依赖不支持群类型过滤，停止发送') from e
-
+            raise RuntimeError('依赖不支持群类型过滤') from e
         if not ok:
-            self.log(f"[wechat] 搜索返回 False，找不到 ChatRoom 匹配的「{group}」")
             return False
-
-        # 严格轮询校验 exact name——防止搜索点到相似名
         deadline = time.time() + timeout
-        last_seen = None
         while time.time() < deadline:
-            last_seen = uia.current_chat()
-            if last_seen == group:
+            if uia.current_chat() == group:
                 return True
             time.sleep(0.4)
-
-        self.log(f"[wechat] open_chat 后校验失败：最后看到={last_seen!r}，期望={group!r}")
         return False
 
-    # ---------- send_to_group ----------
-
-    def send_to_group(self, group, text, retries=1):
-        """发送文本到指定群。加固：ChatRoom section + exact name 强校验。
-
-        注意：UIA COM 必须在同一个线程里 Initialize + 使用，
-        所以这里**不做线程隔离**。硬超时由父进程终止发送子进程处理。
-        """
+    def send_to_group(self, group, text, retries=2):
         gui, uia = self._engine()
         from wechatauto.param import WxParam
-        WxParam.ENABLE_OCR = False  # 安全红线：禁用一切坐标盲猜兜底
+        WxParam.ENABLE_OCR = False
         last_err = None
         for i in range(1, retries + 1):
             try:
-                mark = None
-                try:
-                    mark = gui._send_watermark(group)
-                except Exception as e:
-                    self.log(f"[wechat] 水位获取失败（跳过 DB 回执）: {e}")
-
                 if not self._ensure_chat(uia, group):
-                    cur = uia.current_chat()
-                    raise RuntimeError(
-                        f"未能确认当前会话为「{group}」（当前={cur!r}），已中止发送")
-
+                    raise RuntimeError(f"未能确认当前会话为「{group}」")
                 if not uia.send_text(text):
-                    raise RuntimeError("send_text 未确认（回读不达标，已拒绝回车）")
-
-                if mark is not None:
-                    try:
-                        if gui._wait_landed(text, group, mark):
-                            self.log(f"[wechat] 已发送并确认 → {group}")
-                        else:
-                            self.log(f"[wechat] 已发送 → {group}（DB 回执未确认，UIA 校验已通过）")
-                    except Exception as e:
-                        self.log(f"[wechat] 已发送 → {group}（DB 回执异常: {e}）")
-                else:
-                    self.log(f"[wechat] 已发送 → {group}（无水位，跳过 DB 回执）")
+                    raise RuntimeError("send_text 未确认")
+                self.log(f"[wechat] 已发送 → {group}")
                 return
             except Exception as e:
                 last_err = str(e)
-                self.log(f"[wechat] 第 {i}/{retries} 次发送失败: {last_err}")
+                self.log(f"[wechat] 第 {i}/{retries} 次失败: {last_err}")
                 time.sleep(2)
         raise RuntimeError(f"发送到「{group}」重试 {retries} 次均失败: {last_err}")
 
 
-def com_init():
-    try:
-        import uiautomation as auto
-        auto.InitializeUIAutomationInCurrentThread()
-    except Exception as e:
-        raise RuntimeError('UIA 初始化失败') from e
+# ---------------------------------------------------------------------------
+# WcferryClient —— 微信 3.9.12.x hook 注入
+# ---------------------------------------------------------------------------
 
+class WcferryClient:
+    """Wcferry hook 注入引擎（微信 3.9.12.x，API 级不依赖窗口）"""
+
+    def __init__(self, window_names=None, log=print):
+        self.log = log
+        try:
+            import wcferry  # noqa: F401
+            self._available = True
+        except Exception:
+            self._available = False
+
+    def is_logged_in(self):
+        return self._available
+
+    def send_to_group(self, group, text, retries=1):
+        if not self._available:
+            raise RuntimeError("wcferry 不可用（需微信 3.9.12.x）")
+        # 极简实现：直接调用 wcferry API 发群
+        import wcferry
+        wcf = wcferry.Wcf()
+        try:
+            wcf.send_text(text, f"{group}@chatroom")
+            self.log(f"[wcferry] 已发送 → {group}")
+        finally:
+            wcf.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# 工厂
+# ---------------------------------------------------------------------------
 
 def make_client(window_names=None, log=print):
     engine = _engine_name()
     log(f"[engine] 使用 {engine} 引擎")
-    if engine != 'rpa':
-        raise RuntimeError('仅启用 RPA，Hook 未验证')
-    return RpaClient(window_names=window_names, log=log)
+    if engine == "agent-desktop":
+        return AgentDesktopClient(window_names=window_names, log=log)
+    if engine == "wcferry":
+        return WcferryClient(window_names=window_names, log=log)
+    if engine == "rpa":
+        return RpaClient(window_names=window_names, log=log)
+    raise RuntimeError(f"未知引擎: {engine}")
