@@ -249,22 +249,41 @@ class AgentDesktopClient:
             return False
 
     def send_to_group(self, group, text, retries=2):
-        """发送文本到指定群。"""
-        self.log(f"[agent-desktop] 开始发群「{group}」")
-        # 注意：agent-desktop 通过 UIA semantic API 操作，不需要窗口可见/前置。
-        # 微信可以最小化到托盘，照样能 click/type/press。
+        """发送文本到指定群。
 
+        agent-desktop 的 action 命令（click/clear/press）对 offscreen 窗口
+        一律拒绝操作，强制 --headed 就会把微信拉前台 3-5 秒。
+        所以我们：让它拉、发完立刻 minimize 回去，把抢焦点时间缩到最短。
+        """
+        self.log(f"[agent-desktop] 开始发群「{group}」")
         last_err = None
-        for attempt in range(1, retries + 1):
-            try:
-                self._send_once(group, text)
-                self.log(f"[agent-desktop] 已发送 → {group}")
-                return
-            except Exception as e:
-                last_err = str(e)
-                self.log(f"[agent-desktop] 第 {attempt}/{retries} 次失败: {last_err}")
-                time.sleep(3)
-        raise RuntimeError(f"agent-desktop 发送「{group}」重试 {retries} 次均失败: {last_err}")
+        try:
+            for attempt in range(1, retries + 1):
+                try:
+                    self._send_once(group, text)
+                    self.log(f"[agent-desktop] 已发送 → {group}")
+                    return
+                except Exception as e:
+                    last_err = str(e)
+                    self.log(f"[agent-desktop] 第 {attempt}/{retries} 次失败: {last_err}")
+                    time.sleep(3)
+            raise RuntimeError(f"agent-desktop 发送「{group}」重试 {retries} 次均失败: {last_err}")
+        finally:
+            # 无论成败，立刻把微信推回任务栏，抢焦点时间缩到最短
+            self._minimize_wechat()
+
+    def _minimize_wechat(self):
+        """发送完立刻把微信最小化，不让它停在前台挡屏幕。"""
+        try:
+            self._run(["minimize", "--app", self.APP], timeout=8, require_ok=False)
+        except Exception:
+            pass
+        # 保险：也强制 move-window 到 (-32000, -32000)，Windows 最小化的标准坐标
+        try:
+            self._run(["move-window", "--app", self.APP, "--x", "-32000", "--y", "-32000"],
+                      timeout=5, require_ok=False)
+        except Exception:
+            pass
 
     def _send_once(self, group, text):
         """单次发送流程。"""
